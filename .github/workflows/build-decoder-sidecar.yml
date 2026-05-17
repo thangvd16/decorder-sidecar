@@ -2,6 +2,11 @@ name: Build Decoder Sidecar
 
 on:
   workflow_dispatch:
+    inputs:
+      cmake_source_dir:
+        description: "Folder chứa CMakeLists.txt, ví dụ: . hoặc native/decoder"
+        required: false
+        default: "."
   push:
     tags:
       - "v*"
@@ -12,7 +17,7 @@ permissions:
 env:
   BINARY_BASENAME: pack-audit-decoder
   WINDOWS_TARGET_TRIPLE: x86_64-pc-windows-msvc
-  CMAKE_SOURCE_DIR: .
+  CMAKE_SOURCE_DIR: ${{ github.event.inputs.cmake_source_dir || '.' }}
   CMAKE_BUILD_DIR: build/windows-msvc
   CMAKE_TARGET: pack-audit-decoder
   VCPKG_TARGET_TRIPLET: x64-windows-static
@@ -42,9 +47,46 @@ jobs:
           restore-keys: |
             vcpkg-${{ runner.os }}-
 
+      - name: Resolve CMake source dir
+        shell: pwsh
+        run: |
+          $sourceDir = "${env:CMAKE_SOURCE_DIR}"
+          if ([string]::IsNullOrWhiteSpace($sourceDir)) {
+            $sourceDir = "."
+          }
+
+          $candidate = Resolve-Path -Path $sourceDir -ErrorAction SilentlyContinue
+          if ($candidate -and (Test-Path (Join-Path $candidate.Path "CMakeLists.txt"))) {
+            echo "CMAKE_SOURCE_DIR=$($candidate.Path)" >> $env:GITHUB_ENV
+            Write-Host "Using CMake source dir: $($candidate.Path)"
+            exit 0
+          }
+
+          Write-Host "CMakeLists.txt was not found in '$sourceDir'. Searching repository..."
+          $matches = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter CMakeLists.txt -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](\.git|build|vcpkg_installed)[\\/]' })
+
+          if ($matches.Count -eq 0) {
+            throw "No CMakeLists.txt found. Set workflow_dispatch input 'cmake_source_dir' to the decoder source folder."
+          }
+
+          if ($matches.Count -gt 1) {
+            $paths = ($matches | ForEach-Object { $_.DirectoryName }) -join "`n"
+            throw "Multiple CMakeLists.txt files found. Set workflow_dispatch input 'cmake_source_dir' explicitly. Candidates:`n$paths"
+          }
+
+          $resolved = $matches[0].DirectoryName
+          echo "CMAKE_SOURCE_DIR=$resolved" >> $env:GITHUB_ENV
+          Write-Host "Using discovered CMake source dir: $resolved"
+
       - name: Configure CMake
         shell: pwsh
         run: |
+          $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+          if (!(Test-Path $toolchain)) {
+            throw "vcpkg toolchain not found: $toolchain"
+          }
+
           cmake `
             -S "${env:CMAKE_SOURCE_DIR}" `
             -B "${env:CMAKE_BUILD_DIR}" `
@@ -52,7 +94,7 @@ jobs:
             -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DVCPKG_TARGET_TRIPLET="${env:VCPKG_TARGET_TRIPLET}" `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain"
 
       - name: Build decoder
         shell: pwsh
@@ -80,9 +122,14 @@ jobs:
           }
 
           $args = "${env:SMOKE_TEST_ARGS}".Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
-          & "${env:DECODER_BINARY}" @args
-          if ($LASTEXITCODE -ne 0) {
-            throw "Decoder smoke test failed with exit code $LASTEXITCODE"
+          Push-Location "${env:CMAKE_SOURCE_DIR}"
+          try {
+            & "${env:GITHUB_WORKSPACE}\${env:DECODER_BINARY}" @args
+            if ($LASTEXITCODE -ne 0) {
+              throw "Decoder smoke test failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
           }
 
       - name: Upload decoder artifact
