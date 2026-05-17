@@ -1,0 +1,123 @@
+name: Build ZBar Decoder macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      cmake_source_dir:
+        description: "Folder chứa CMakeLists.txt, ví dụ: . hoặc native/decoder"
+        required: false
+        default: "."
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_BASENAME: pack-audit-decoder
+  CMAKE_BUILD_DIR: build/macos
+  CMAKE_SOURCE_DIR: ${{ github.event.inputs.cmake_source_dir || '.' }}
+  CMAKE_TARGET: pack-audit-decoder
+  SMOKE_TEST_ARGS: --decode-image fixtures/sample.pgm
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install decoder dependencies
+        shell: bash
+        run: |
+          for formula in ninja pkgconf zbar; do
+            if ! brew list "$formula" >/dev/null 2>&1; then
+              brew install "$formula"
+            fi
+          done
+
+          zbar_prefix="$(brew --prefix zbar)"
+          echo "PKG_CONFIG_PATH=$zbar_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$zbar_prefix:${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+
+          cmake --version
+          ninja --version
+          pkg-config --modversion zbar
+
+      - name: Resolve target triple
+        shell: bash
+        run: |
+          arch="$(uname -m)"
+          if [ "$arch" = "arm64" ]; then
+            echo "TARGET_TRIPLE=aarch64-apple-darwin" >> "$GITHUB_ENV"
+          else
+            echo "TARGET_TRIPLE=x86_64-apple-darwin" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve CMake source dir
+        shell: bash
+        run: |
+          source_dir="${CMAKE_SOURCE_DIR:-.}"
+          if [ -f "$source_dir/CMakeLists.txt" ]; then
+            echo "CMAKE_SOURCE_DIR=$(cd "$source_dir" && pwd)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "CMakeLists.txt was not found in '$source_dir'. Set workflow_dispatch input 'cmake_source_dir' to the decoder source folder." >&2
+          exit 1
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake \
+            -S "$CMAKE_SOURCE_DIR" \
+            -B "$CMAKE_BUILD_DIR" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build decoder
+        shell: bash
+        run: |
+          cmake --build "$CMAKE_BUILD_DIR" --target "$CMAKE_TARGET" --parallel
+
+      - name: Package sidecar binary
+        shell: bash
+        run: |
+          source="$CMAKE_BUILD_DIR/$BINARY_BASENAME"
+          if [ ! -f "$source" ]; then
+            source="$(find "$CMAKE_BUILD_DIR" -type f -name "$BINARY_BASENAME" -perm -111 | head -n 1)"
+          fi
+
+          if [ -z "$source" ] || [ ! -f "$source" ]; then
+            echo "Decoder binary not found" >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          target="dist/$BINARY_BASENAME-$TARGET_TRIPLE"
+          cp "$source" "$target"
+          chmod +x "$target"
+          echo "DECODER_BINARY=$target" >> "$GITHUB_ENV"
+
+      - name: Smoke test decoder
+        shell: bash
+        run: |
+          pushd "$CMAKE_SOURCE_DIR"
+          "$GITHUB_WORKSPACE/$DECODER_BINARY" --decode-image fixtures/sample.pgm
+          popd
+
+      - name: Upload decoder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pack-audit-decoder-${{ env.TARGET_TRIPLE }}
+          path: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}

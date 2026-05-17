@@ -1,0 +1,169 @@
+name: Build ZBar Decoder Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      cmake_source_dir:
+        description: "Folder chứa CMakeLists.txt, ví dụ: . hoặc native/decoder"
+        required: false
+        default: "."
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_BASENAME: pack-audit-decoder
+  CMAKE_BUILD_DIR: build/windows-msvc
+  CMAKE_SOURCE_DIR: ${{ github.event.inputs.cmake_source_dir || '.' }}
+  CMAKE_TARGET: pack-audit-decoder
+  SMOKE_TEST_ARGS: --decode-image fixtures/sample.pgm
+  TARGET_TRIPLE: x86_64-pc-windows-msvc
+  VCPKG_TARGET_TRIPLET: x64-windows-static
+
+jobs:
+  build-windows-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/vcpkg_installed
+            ${{ github.workspace }}/build/windows-msvc/vcpkg_installed
+            ~\AppData\Local\vcpkg\archives
+          key: zbar-vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
+          restore-keys: |
+            zbar-vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-
+            zbar-vcpkg-${{ runner.os }}-
+
+      - name: Resolve CMake source dir
+        shell: pwsh
+        run: |
+          $sourceDir = "${env:CMAKE_SOURCE_DIR}"
+          if ([string]::IsNullOrWhiteSpace($sourceDir)) {
+            $sourceDir = "."
+          }
+
+          $candidate = Resolve-Path -Path $sourceDir -ErrorAction SilentlyContinue
+          if ($candidate -and (Test-Path (Join-Path $candidate.Path "CMakeLists.txt"))) {
+            echo "CMAKE_SOURCE_DIR=$($candidate.Path)" >> $env:GITHUB_ENV
+            Write-Host "Using CMake source dir: $($candidate.Path)"
+            exit 0
+          }
+
+          throw "CMakeLists.txt was not found in '$sourceDir'. Set workflow_dispatch input 'cmake_source_dir' to the decoder source folder."
+
+      - name: Resolve vcpkg root
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          $toolchain = ""
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot) -or !(Test-Path $vcpkgRoot)) {
+            if (Test-Path "C:\vcpkg") {
+              $vcpkgRoot = "C:\vcpkg"
+            }
+          }
+
+          if (![string]::IsNullOrWhiteSpace($vcpkgRoot) -and (Test-Path $vcpkgRoot)) {
+            $candidateToolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+            if (Test-Path $candidateToolchain) {
+              $toolchain = $candidateToolchain
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($toolchain)) {
+            $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+            if (!(Test-Path $vcpkgRoot)) {
+              git clone https://github.com/microsoft/vcpkg.git $vcpkgRoot
+            }
+            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+            $toolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+          }
+
+          if (!(Test-Path $toolchain)) {
+            throw "vcpkg toolchain not found: $toolchain"
+          }
+
+          echo "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          echo "VCPKG_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake `
+            -S "${env:CMAKE_SOURCE_DIR}" `
+            -B "${env:CMAKE_BUILD_DIR}" `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVCPKG_TARGET_TRIPLET="${env:VCPKG_TARGET_TRIPLET}" `
+            -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_TOOLCHAIN}"
+
+      - name: Build decoder
+        shell: pwsh
+        run: |
+          cmake --build "${env:CMAKE_BUILD_DIR}" --config Release --target "${env:CMAKE_TARGET}" --parallel
+
+      - name: Package sidecar binary
+        shell: pwsh
+        run: |
+          $source = Join-Path "${env:CMAKE_BUILD_DIR}" "Release\${env:BINARY_BASENAME}.exe"
+          if (!(Test-Path $source)) {
+            throw "Decoder binary not found: $source"
+          }
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $target = "dist\${env:BINARY_BASENAME}-${env:TARGET_TRIPLE}.exe"
+          Copy-Item $source $target -Force
+          echo "DECODER_BINARY=$target" >> $env:GITHUB_ENV
+
+      - name: Smoke test decoder
+        shell: pwsh
+        run: |
+          $args = "${env:SMOKE_TEST_ARGS}".Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+          Push-Location "${env:CMAKE_SOURCE_DIR}"
+          try {
+            & "${env:GITHUB_WORKSPACE}\${env:DECODER_BINARY}" @args
+            if ($LASTEXITCODE -ne 0) {
+              throw "Decoder smoke test failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Check Windows sidecar dependencies
+        shell: pwsh
+        run: |
+          $depends = & dumpbin /dependents "${env:DECODER_BINARY}" 2>&1
+          $depends | Write-Host
+
+          $unexpected = $depends | Select-String -Pattern "zbar|libzbar|iconv|libiconv|intl|gettext"
+          if ($unexpected) {
+            throw "Decoder binary still depends on native DLLs that are not bundled by this template: $($unexpected -join ', ')"
+          }
+
+      - name: Upload decoder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pack-audit-decoder-${{ env.TARGET_TRIPLE }}
+          path: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}.exe
