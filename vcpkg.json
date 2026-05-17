@@ -1,5 +1,11 @@
 {
-  "name": "pack-audit-decoder",
+  "name": "pack-audit-zbar-decoder",
   "version-string": "0.1.0",
-  "dependencies": ["nu-book-zxing-cpp"]
+  "dependencies": [
+    "mchehab-zbar",
+    {
+      "name": "pkgconf",
+      "host": true
+    }
+  ]
 }
