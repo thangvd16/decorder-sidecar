@@ -8,7 +8,9 @@ Repo đích sau khi copy nên có cấu trúc:
 .github/workflows/build-zbar-decoder-macos.yml
 .github/workflows/build-zbar-decoder-windows.yml
 .github/workflows/build-ffmpeg-windows.yml
+.gitignore
 CMakeLists.txt
+RELEASE.md
 vcpkg.json
 triplets/x64-windows-dynamic-staticcrt.cmake
 src/main.cpp
@@ -43,6 +45,8 @@ Các format ngoài scope ZBar core: `DataMatrix`, `PDF417`, `Aztec`, `Micro QR`,
 
 ## Run workflow
 
+Workflow file phải nằm dưới `.github/workflows/` ở root repo sidecar. Nếu workflow còn nằm dưới `docs/`, GitHub Actions không chạy khi push tag.
+
 Vào GitHub repo decoder:
 
 1. Actions.
@@ -75,7 +79,7 @@ macOS artifact phụ thuộc host runner thực tế nên chỉ có một trong 
 
 Khi copy sang project khác, đổi `BINARY_BASENAME`, `CMAKE_TARGET`, tên artifact và tên executable trong `CMakeLists.txt` nếu không muốn dùng prefix `pack-audit-decoder`.
 
-Nếu push tag `v*`, workflow publish binary vào GitHub Release.
+Manual workflow tạo Actions artifact để kiểm nhanh. Nếu push tag `v*`, workflow chạy lại từ tag đó và publish binary vào GitHub Release. Xem `RELEASE.md` trước khi tạo tag release.
 
 ## Windows-first app build
 
