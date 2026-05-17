@@ -19,9 +19,9 @@ env:
   CMAKE_BUILD_DIR: build/windows-msvc
   CMAKE_SOURCE_DIR: ${{ github.event.inputs.cmake_source_dir || '.' }}
   CMAKE_TARGET: pack-audit-decoder
-  SMOKE_TEST_ARGS: --decode-image fixtures/sample.pgm
   TARGET_TRIPLE: x86_64-pc-windows-msvc
-  VCPKG_TARGET_TRIPLET: x64-windows-static
+  VCPKG_REF: "2024.11.16"
+  VCPKG_TARGET_TRIPLET: x64-windows-dynamic-staticcrt
 
 jobs:
   build-windows-msvc:
@@ -44,10 +44,10 @@ jobs:
             ${{ github.workspace }}/vcpkg_installed
             ${{ github.workspace }}/build/windows-msvc/vcpkg_installed
             ~\AppData\Local\vcpkg\archives
-          key: zbar-vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
+          key: zbar-vcpkg-${{ env.VCPKG_REF }}-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
           restore-keys: |
-            zbar-vcpkg-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-
-            zbar-vcpkg-${{ runner.os }}-
+            zbar-vcpkg-${{ env.VCPKG_REF }}-${{ runner.os }}-${{ env.VCPKG_TARGET_TRIPLET }}-
+            zbar-vcpkg-${{ env.VCPKG_REF }}-${{ runner.os }}-
 
       - name: Resolve CMake source dir
         shell: pwsh
@@ -66,39 +66,23 @@ jobs:
 
           throw "CMakeLists.txt was not found in '$sourceDir'. Set workflow_dispatch input 'cmake_source_dir' to the decoder source folder."
 
-      - name: Resolve vcpkg root
+      - name: Setup pinned vcpkg
         shell: pwsh
         run: |
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          $toolchain = ""
-          if ([string]::IsNullOrWhiteSpace($vcpkgRoot) -or !(Test-Path $vcpkgRoot)) {
-            if (Test-Path "C:\vcpkg") {
-              $vcpkgRoot = "C:\vcpkg"
-            }
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg-${env:VCPKG_REF}"
+          if (!(Test-Path $vcpkgRoot)) {
+            git clone --depth 1 --branch "${env:VCPKG_REF}" https://github.com/microsoft/vcpkg.git $vcpkgRoot
           }
 
-          if (![string]::IsNullOrWhiteSpace($vcpkgRoot) -and (Test-Path $vcpkgRoot)) {
-            $candidateToolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
-            if (Test-Path $candidateToolchain) {
-              $toolchain = $candidateToolchain
-            }
-          }
-
-          if ([string]::IsNullOrWhiteSpace($toolchain)) {
-            $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
-            if (!(Test-Path $vcpkgRoot)) {
-              git clone https://github.com/microsoft/vcpkg.git $vcpkgRoot
-            }
-            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
-            $toolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
-          }
-
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          $toolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
           if (!(Test-Path $toolchain)) {
             throw "vcpkg toolchain not found: $toolchain"
           }
 
           echo "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
           echo "VCPKG_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          Write-Host "Using vcpkg ${env:VCPKG_REF}: $vcpkgRoot"
 
       - name: Configure CMake
         shell: pwsh
@@ -110,6 +94,7 @@ jobs:
             -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DVCPKG_TARGET_TRIPLET="${env:VCPKG_TARGET_TRIPLET}" `
+            -DVCPKG_OVERLAY_TRIPLETS="${env:CMAKE_SOURCE_DIR}\triplets" `
             -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_TOOLCHAIN}"
 
       - name: Build decoder
@@ -117,7 +102,7 @@ jobs:
         run: |
           cmake --build "${env:CMAKE_BUILD_DIR}" --config Release --target "${env:CMAKE_TARGET}" --parallel
 
-      - name: Package sidecar binary
+      - name: Package sidecar binary and DLL closure
         shell: pwsh
         run: |
           $source = Join-Path "${env:CMAKE_BUILD_DIR}" "Release\${env:BINARY_BASENAME}.exe"
@@ -125,45 +110,139 @@ jobs:
             throw "Decoder binary not found: $source"
           }
 
+          $vcpkgBinDir = Join-Path "${env:CMAKE_BUILD_DIR}" "vcpkg_installed\${env:VCPKG_TARGET_TRIPLET}\bin"
+          if (!(Test-Path $vcpkgBinDir)) {
+            throw "vcpkg runtime bin dir not found: $vcpkgBinDir"
+          }
+
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
           $target = "dist\${env:BINARY_BASENAME}-${env:TARGET_TRIPLE}.exe"
           Copy-Item $source $target -Force
+
+          function Get-DependencyNames([string]$binaryPath) {
+            $depends = & dumpbin /dependents $binaryPath 2>&1
+            $depends | Write-Host
+            $names = @()
+            foreach ($line in $depends) {
+              if ($line -match '^\s*([A-Za-z0-9_.+-]+\.dll)\s*$') {
+                $names += $Matches[1]
+              }
+            }
+            return $names | Sort-Object -Unique
+          }
+
+          function Test-SystemDll([string]$dllName) {
+            return $dllName -match '^(api-ms-|ext-ms-)' -or $dllName -match '^(advapi32|bcrypt|comctl32|comdlg32|crypt32|gdi32|imm32|kernel32|msvcrt|ntdll|ole32|oleaut32|rpcrt4|secur32|shell32|shlwapi|ucrtbase|user32|version|winmm|ws2_32)\.dll$'
+          }
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $queue.Enqueue((Resolve-Path $target).Path)
+
+          while ($queue.Count -gt 0) {
+            $binary = $queue.Dequeue()
+            if (!$visited.Add($binary)) {
+              continue
+            }
+
+            foreach ($dllName in Get-DependencyNames $binary) {
+              if (Test-SystemDll $dllName) {
+                continue
+              }
+
+              $distDll = Join-Path "dist" $dllName
+              if (Test-Path $distDll) {
+                $queue.Enqueue((Resolve-Path $distDll).Path)
+                continue
+              }
+
+              $sourceDll = Join-Path $vcpkgBinDir $dllName
+              if (!(Test-Path $sourceDll)) {
+                throw "Missing non-system dependency '$dllName' for '$binary'. Expected it in '$vcpkgBinDir'."
+              }
+
+              Copy-Item $sourceDll $distDll -Force
+              Write-Host "Bundled DLL: $dllName"
+              $queue.Enqueue((Resolve-Path $distDll).Path)
+            }
+          }
+
+          $hasZbar = Get-ChildItem "dist\*.dll" | Where-Object { $_.Name -imatch "zbar" }
+          if (!$hasZbar) {
+            throw "zbar.dll not found in dist/. Dynamic ZBar bundle is incomplete."
+          }
+
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table | Out-String | Write-Host
           echo "DECODER_BINARY=$target" >> $env:GITHUB_ENV
 
-      - name: Smoke test decoder
+      - name: Smoke test decoder - decode-image
         shell: pwsh
         run: |
-          $args = "${env:SMOKE_TEST_ARGS}".Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+          $decoderPath = Join-Path "${env:GITHUB_WORKSPACE}" "${env:DECODER_BINARY}"
           Push-Location "${env:CMAKE_SOURCE_DIR}"
           try {
-            & "${env:GITHUB_WORKSPACE}\${env:DECODER_BINARY}" @args
+            $output = & $decoderPath --decode-image fixtures/sample.pgm 2>&1
             if ($LASTEXITCODE -ne 0) {
-              throw "Decoder smoke test failed with exit code $LASTEXITCODE"
+              throw "decode-image exited $LASTEXITCODE. Output: $output"
             }
+            Write-Host "Raw output: $output"
+            $json = $output | ConvertFrom-Json
+            if ($null -eq $json.PSObject.Properties['results']) {
+              throw "JSON missing 'results' field. Output: $output"
+            }
+            if ($null -eq $json.PSObject.Properties['timestamp']) {
+              throw "JSON missing 'timestamp' field. Output: $output"
+            }
+            Write-Host "decode-image smoke test passed (results=$($json.results.Count))"
           } finally {
             Pop-Location
           }
 
-      - name: Check Windows sidecar dependencies
+      - name: Smoke test decoder - decode-stdin binary mode
         shell: pwsh
         run: |
-          $depends = & dumpbin /dependents "${env:DECODER_BINARY}" 2>&1
-          $depends | Write-Host
+          $decoderPath = Join-Path "${env:GITHUB_WORKSPACE}" "${env:DECODER_BINARY}"
+          $width = 8; $height = 8
+          $pixelCount = $width * $height
+          $headerBytes = [System.Text.Encoding]::ASCII.GetBytes("FRAME $width $height $pixelCount`n")
+          $pixelBytes = [byte[]]::new($pixelCount)
+          [Array]::Fill($pixelBytes, [byte]255)
+          $frameBytes = $headerBytes + $pixelBytes
 
-          $unexpected = $depends | Select-String -Pattern "zbar|libzbar|iconv|libiconv|intl|gettext"
-          if ($unexpected) {
-            throw "Decoder binary still depends on native DLLs that are not bundled by this template: $($unexpected -join ', ')"
+          $psi = [System.Diagnostics.ProcessStartInfo]::new($decoderPath, "--decode-stdin")
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.UseShellExecute = $false
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $proc.StandardInput.BaseStream.Write($frameBytes, 0, $frameBytes.Length)
+          $proc.StandardInput.Close()
+          $stdout = $proc.StandardOutput.ReadToEnd()
+          $stderr = $proc.StandardError.ReadToEnd()
+          $proc.WaitForExit(10000) | Out-Null
+
+          if ($proc.ExitCode -ne 0) {
+            throw "decode-stdin exited $($proc.ExitCode). stderr: $stderr"
           }
+          Write-Host "Raw stdout: $stdout"
+          $json = $stdout | ConvertFrom-Json
+          if ($null -eq $json.PSObject.Properties['results']) {
+            throw "decode-stdin JSON missing 'results'. Output: $stdout"
+          }
+          if ($null -eq $json.PSObject.Properties['timestamp']) {
+            throw "decode-stdin JSON missing 'timestamp'. Output: $stdout"
+          }
+          Write-Host "decode-stdin smoke test passed (binary mode OK, results=$($json.results.Count))"
 
       - name: Upload decoder artifact
         uses: actions/upload-artifact@v4
         with:
           name: pack-audit-decoder-${{ env.TARGET_TRIPLE }}
-          path: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}.exe
+          path: dist/
           if-no-files-found: error
 
       - name: Publish GitHub Release asset
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/pack-audit-decoder-${{ env.TARGET_TRIPLE }}.exe
+          files: dist/*

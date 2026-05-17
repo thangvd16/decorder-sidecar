@@ -1,14 +1,16 @@
 # Pack Audit ZBar Decoder Sidecar Template
 
-Copy toàn bộ nội dung folder này sang repo build decoder riêng.
+Copy toàn bộ nội dung folder này sang repo build native sidecar riêng.
 
 Repo đích sau khi copy nên có cấu trúc:
 
 ```text
 .github/workflows/build-zbar-decoder-macos.yml
 .github/workflows/build-zbar-decoder-windows.yml
+.github/workflows/build-ffmpeg-windows.yml
 CMakeLists.txt
 vcpkg.json
+triplets/x64-windows-dynamic-staticcrt.cmake
 src/main.cpp
 fixtures/sample.pgm
 ```
@@ -52,13 +54,19 @@ Vào GitHub repo decoder:
 Hai workflow tách riêng để macOS và Windows không chặn nhau:
 
 - macOS dùng Homebrew `zbar` + `ninja`, không chạy vcpkg.
-- Windows dùng MSVC + vcpkg manifest với triplet `x64-windows-static`.
-- Windows workflow kiểm tra `dumpbin /dependents` để tránh ship binary còn phụ thuộc `zbar`/`iconv`/`gettext` DLL ngoài bundle.
+- Windows dùng MSVC + vcpkg manifest với overlay triplet `x64-windows-dynamic-staticcrt`.
+- Windows decoder artifact là dynamic bundle: `.exe` + `zbar.dll` + DLL runtime non-system nếu có.
+- Overlay triplet giữ ZBar là DLL nhưng link CRT static để giảm rủi ro máy Windows sạch thiếu MSVC runtime.
+- Windows workflow kiểm tra `dumpbin /dependents` đệ quy để tránh ship artifact còn thiếu DLL non-system.
+- FFmpeg Windows workflow package một FFmpeg LGPL build thành Tauri sidecar `ffmpeg-x86_64-pc-windows-msvc.exe`.
 
 Artifact đầu ra:
 
 ```text
 pack-audit-decoder-x86_64-pc-windows-msvc.exe
+zbar.dll
+<zbar-runtime-dependencies>.dll
+ffmpeg-x86_64-pc-windows-msvc.exe
 pack-audit-decoder-aarch64-apple-darwin
 pack-audit-decoder-x86_64-apple-darwin
 ```
@@ -71,35 +79,44 @@ Nếu push tag `v*`, workflow publish binary vào GitHub Release.
 
 ## Windows-first app build
 
-macOS Homebrew chỉ phục vụ dev/test sidecar trên máy macOS. Windows app build không dùng Homebrew.
+macOS Homebrew chỉ phục vụ dev/test sidecar trên máy macOS. Dev trên macOS có thể dùng Homebrew `zbar` để tiết kiệm thời gian build/lặp protocol. Windows app build không dùng Homebrew, và macOS pass không thay thế Windows release gate.
 
 Luồng Windows-first nên là:
 
 1. Chạy `Build ZBar Decoder Windows`.
-2. Lấy artifact hoặc release asset:
+2. Chạy `Build FFmpeg Windows Sidecar`.
+3. Lấy artifact hoặc release asset:
 
 ```text
 pack-audit-decoder-x86_64-pc-windows-msvc.exe
+zbar.dll
+<zbar-runtime-dependencies>.dll
+ffmpeg-x86_64-pc-windows-msvc.exe
 ```
 
-3. Trước khi chạy `pnpm tauri build` trong app repo, copy file vào:
+4. Trước khi chạy `pnpm tauri build` trong app repo, copy file vào:
 
 ```text
 src-tauri/binaries/pack-audit-decoder-x86_64-pc-windows-msvc.exe
+src-tauri/binaries/zbar.dll
+src-tauri/binaries/<zbar-runtime-dependencies>.dll
 ```
 
-4. Copy FFmpeg sidecar Windows vào cùng folder:
+5. Copy FFmpeg sidecar Windows vào cùng folder:
 
 ```text
 src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
 ```
 
-5. Tauri config trỏ sidecar theo base name:
+6. Tauri config trỏ sidecar theo base name và bundle DLL bằng resources:
 
 ```json
 {
   "bundle": {
-    "externalBin": ["binaries/pack-audit-decoder", "binaries/ffmpeg"]
+    "externalBin": ["binaries/pack-audit-decoder", "binaries/ffmpeg"],
+    "resources": {
+      "binaries/*.dll": "binaries/"
+    }
   }
 }
 ```
@@ -115,6 +132,19 @@ pack-audit-decoder-* --decode-image fixtures/sample.pgm
 ```
 
 Fixture hiện tại là ảnh PGM nhỏ không có barcode, nên output hợp lệ sẽ có `results: []`. Thay fixture bằng QR/barcode thật khi cần verify decode thực tế.
+
+## FFmpeg sidecar
+
+Workflow `Build FFmpeg Windows Sidecar` package FFmpeg Windows x64 LGPL build thành:
+
+```text
+ffmpeg-x86_64-pc-windows-msvc.exe
+FFMPEG_SOURCE.txt
+```
+
+Mặc định workflow dùng BtbN `ffmpeg-master-latest-win64-lgpl.zip`, một Windows build provider được link từ trang download chính thức của FFmpeg. Workflow verify SHA-256 từ `checksums.sha256`, smoke test `ffmpeg -version` và một lavfi frame, rồi publish artifact/release asset.
+
+Không đổi sang GPL hoặc nonfree FFmpeg build nếu chưa chốt lại nghĩa vụ license cho product.
 
 ## Runtime stdin protocol
 

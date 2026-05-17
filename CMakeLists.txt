@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
+cmake_policy(SET CMP0091 NEW)
 
 project(pack_audit_zbar_decoder VERSION 0.1.0 LANGUAGES CXX)
 
@@ -29,6 +30,7 @@ else()
 endif()
 
 if(MSVC)
+  set_property(TARGET pack-audit-decoder PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   target_compile_options(pack-audit-decoder PRIVATE /W4 /permissive-)
 else()
   target_compile_options(pack-audit-decoder PRIVATE -Wall -Wextra -Wpedantic)
