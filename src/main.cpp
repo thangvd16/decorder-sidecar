@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,27 @@ struct GrayImage {
   int height = 0;
   std::vector<uint8_t> pixels;
 };
+
+struct ZbarImageDeleter {
+  void operator()(zbar_image_t* image) const
+  {
+    if (image != nullptr) {
+      zbar_image_destroy(image);
+    }
+  }
+};
+
+struct ZbarProcessorDeleter {
+  void operator()(zbar_processor_t* processor) const
+  {
+    if (processor != nullptr) {
+      zbar_processor_destroy(processor);
+    }
+  }
+};
+
+using ZbarImagePtr = std::unique_ptr<zbar_image_t, ZbarImageDeleter>;
+using ZbarProcessorPtr = std::unique_ptr<zbar_processor_t, ZbarProcessorDeleter>;
 
 static std::string next_pnm_token(std::istream& input)
 {
@@ -98,10 +120,7 @@ static int64_t unix_timestamp_ms()
 
 static unsigned long fourcc_y800()
 {
-  return static_cast<unsigned long>('Y') |
-         (static_cast<unsigned long>('8') << 8U) |
-         (static_cast<unsigned long>('0') << 16U) |
-         (static_cast<unsigned long>('0') << 24U);
+  return zbar_fourcc('Y', '8', '0', '0');
 }
 
 static std::string json_escape(std::string_view value)
@@ -153,29 +172,44 @@ static std::string format_name(zbar_symbol_type_t type)
   return name == nullptr ? "UNKNOWN" : name;
 }
 
-static void print_decode_json(zbar_image_scanner_t* scanner, const GrayImage& image)
+static std::string processor_error_message(zbar_processor_t* processor, std::string_view fallback)
+{
+  const char* message = zbar_processor_error_string(processor, 0);
+  if (message == nullptr || message[0] == '\0') {
+    return std::string(fallback);
+  }
+  return message;
+}
+
+static void print_decode_json(zbar_processor_t* processor, const GrayImage& image)
 {
   if (image.width <= 0 || image.height <= 0) {
     throw std::runtime_error("Invalid image size");
   }
+  if (image.pixels.size() > static_cast<size_t>(std::numeric_limits<unsigned long>::max())) {
+    throw std::runtime_error("Image payload is too large for ZBar");
+  }
 
-  zbar_image_t* zbar_image = zbar_image_create();
+  ZbarImagePtr zbar_image(zbar_image_create());
   if (zbar_image == nullptr) {
     throw std::runtime_error("Cannot allocate ZBar image");
   }
 
-  zbar_image_set_format(zbar_image, fourcc_y800());
-  zbar_image_set_size(zbar_image, static_cast<unsigned>(image.width), static_cast<unsigned>(image.height));
-  zbar_image_set_data(zbar_image, image.pixels.data(), image.pixels.size(), nullptr);
+  zbar_image_set_format(zbar_image.get(), fourcc_y800());
+  zbar_image_set_size(zbar_image.get(), static_cast<unsigned>(image.width), static_cast<unsigned>(image.height));
+  zbar_image_set_data(zbar_image.get(), image.pixels.data(), static_cast<unsigned long>(image.pixels.size()), nullptr);
 
   const int64_t timestamp = unix_timestamp_ms();
-  zbar_scan_image(scanner, zbar_image);
+  if (zbar_process_image(processor, zbar_image.get()) < 0) {
+    throw std::runtime_error(processor_error_message(processor, "ZBar failed to process image"));
+  }
 
   std::cout << "{\"results\":[";
   bool first = true;
-  for (const zbar_symbol_t* symbol = zbar_image_first_symbol(zbar_image); symbol != nullptr; symbol = zbar_symbol_next(symbol)) {
+  for (const zbar_symbol_t* symbol = zbar_image_first_symbol(zbar_image.get()); symbol != nullptr; symbol = zbar_symbol_next(symbol)) {
     const char* data = zbar_symbol_get_data(symbol);
-    if (data == nullptr) {
+    const zbar_symbol_type_t type = zbar_symbol_get_type(symbol);
+    if (data == nullptr || type == ZBAR_PARTIAL) {
       continue;
     }
 
@@ -184,35 +218,39 @@ static void print_decode_json(zbar_image_scanner_t* scanner, const GrayImage& im
     }
     first = false;
     std::cout << "{\"text\":\"" << json_escape(data) << "\",\"format\":\""
-              << json_escape(format_name(zbar_symbol_get_type(symbol))) << "\",\"timestamp\":" << timestamp << "}";
+              << json_escape(format_name(type)) << "\",\"timestamp\":" << timestamp << "}";
   }
   std::cout << "],\"timestamp\":" << timestamp << "}\n";
-
-  zbar_image_destroy(zbar_image);
 }
 
-static zbar_image_scanner_t* create_scanner()
+static ZbarProcessorPtr create_processor()
 {
-  zbar_image_scanner_t* scanner = zbar_image_scanner_create();
-  if (scanner == nullptr) {
-    throw std::runtime_error("Cannot allocate ZBar scanner");
+  ZbarProcessorPtr processor(zbar_processor_create(0));
+  if (processor == nullptr) {
+    throw std::runtime_error("Cannot allocate ZBar processor");
   }
 
-  zbar_image_scanner_set_config(scanner, ZBAR_NONE, ZBAR_CFG_ENABLE, 1);
-  return scanner;
+  if (zbar_processor_init(processor.get(), nullptr, 0) != 0) {
+    throw std::runtime_error(processor_error_message(processor.get(), "Cannot initialize ZBar processor"));
+  }
+
+  if (zbar_processor_set_config(processor.get(), ZBAR_NONE, ZBAR_CFG_ENABLE, 1) != 0) {
+    throw std::runtime_error("Cannot enable ZBar decoder symbologies");
+  }
+
+  return processor;
 }
 
 static void decode_image(const std::string& path)
 {
-  zbar_image_scanner_t* scanner = create_scanner();
+  ZbarProcessorPtr processor = create_processor();
   const GrayImage image = load_pgm(path);
-  print_decode_json(scanner, image);
-  zbar_image_scanner_destroy(scanner);
+  print_decode_json(processor.get(), image);
 }
 
 static void decode_stdin()
 {
-  zbar_image_scanner_t* scanner = create_scanner();
+  ZbarProcessorPtr processor = create_processor();
 
   std::string command;
   while (std::cin >> command) {
@@ -252,11 +290,9 @@ static void decode_stdin()
       std::cin.get();
     }
 
-    print_decode_json(scanner, image);
+    print_decode_json(processor.get(), image);
     std::cout.flush();
   }
-
-  zbar_image_scanner_destroy(scanner);
 }
 
 static void print_usage()
