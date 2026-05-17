@@ -1,0 +1,5 @@
+{
+  "name": "pack-audit-decoder",
+  "version-string": "0.1.0",
+  "dependencies": ["nu-book-zxing-cpp"]
+}

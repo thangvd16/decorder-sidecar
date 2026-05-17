@@ -42,8 +42,9 @@ jobs:
         with:
           path: |
             ${{ github.workspace }}/vcpkg_installed
+            ${{ github.workspace }}/build/windows-msvc/vcpkg_installed
             ~\AppData\Local\vcpkg\archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-
 
@@ -82,7 +83,23 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
-          $toolchain = "$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot) -or !(Test-Path $vcpkgRoot)) {
+            if (Test-Path "C:\vcpkg") {
+              $vcpkgRoot = "C:\vcpkg"
+            } else {
+              $vcpkgCommand = Get-Command vcpkg -ErrorAction SilentlyContinue
+              if ($vcpkgCommand) {
+                $vcpkgRoot = Split-Path -Parent $vcpkgCommand.Source
+              }
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot) -or !(Test-Path $vcpkgRoot)) {
+            throw "Cannot resolve vcpkg root. Expected VCPKG_INSTALLATION_ROOT, C:\vcpkg, or vcpkg in PATH."
+          }
+
+          $toolchain = Join-Path $vcpkgRoot "scripts\buildsystems\vcpkg.cmake"
           if (!(Test-Path $toolchain)) {
             throw "vcpkg toolchain not found: $toolchain"
           }
